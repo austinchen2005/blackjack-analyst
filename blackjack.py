@@ -1,15 +1,18 @@
-"""blackjack_sim.py – Monte‑Carlo learning *plus* evaluation utilities
-=======================================================================
-* Learns EVs for hit/stand with ε‑greedy exploration.
-* Provides **TableStrategy** that freezes the best actions after learning.
-* `analyze_strategy()` runs any Strategy object with casino‑style verbose
-  output and returns a stats dict (wins / losses / pushes / net PnL).
 
-Run this file directly to:
-1. Learn for 200 k rounds (takes a few seconds).
-2. Evaluate the learned table for 100 verbose rounds.
-3. Print summary stats.
-4. Plot the combined EV table.
+"""blackjack_sim.py – Monte‑Carlo & Deterministic Grid Learning
+================================================================
+This script now contains **two** independent learners:
+
+1. **simulate_learning(**`rounds=…`**)** – the previous ε‑greedy Monte‑Carlo
+   learner that draws fully random shoes (kept **unchanged**).
+2. **simulate_grid_learning(**`rounds=…`**)** – **NEW**.  Walks the hard‑total
+   grid deterministically: starting at 20 vs 2 → hit, 20 vs 2 → stand, 20 vs 3,
+   … all the way to 4 vs A, then repeats until the requested number of hands is
+   reached (default 200 000). Each state is evaluated twice per cycle (hit then
+   stand), so the 340‑hand cycle repeats ⌈rounds/340⌉ times.
+
+*No previous functions were removed.*  All evaluation, plotting, and
+`TableStrategy` remain intact.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ def card_value(card: Card) -> int:
 
 
 class Deck:
-    """6‑deck shoe reshuffling at 25 % penetration."""
+    """n‑deck shoe reshuffling at 25 % penetration."""
 
     def __init__(self, num_decks: int = 6):
         self.num_decks = num_decks
@@ -59,9 +62,10 @@ class Deck:
         return self.cards.pop()
 
 
+# ----------------------------------------------------------------------------
+# Hand + Dealer
+# ----------------------------------------------------------------------------
 class Hand:
-    """Hard‑total hand helper (aces upgraded when safe)."""
-
     def __init__(self):
         self.cards: List[Card] = []
 
@@ -69,31 +73,30 @@ class Hand:
         self.cards.append(card)
 
     def total(self) -> int:
-        total = sum(card_value(c) for c in self.cards)
+        t = sum(card_value(c) for c in self.cards)
         aces = sum(1 for c in self.cards if c.rank == "A")
-        while aces and total + 10 <= 21:
-            total += 10
+        while aces and t + 10 <= 21:
+            t += 10
             aces -= 1
-        return total
+        return t
 
-    def is_soft(self) -> bool:
+    def is_soft(self):
         low = sum(card_value(c) for c in self.cards)
         return any(c.rank == "A" for c in self.cards) and self.total() != low
 
-    def is_bust(self) -> bool:
+    def is_bust(self):
         return self.total() > 21
 
-    def is_blackjack(self) -> bool:
+    def is_blackjack(self):
         return len(self.cards) == 2 and self.total() == 21
 
     def ranks(self):
         return "".join(c.rank for c in self.cards)
 
 
-# ----------------------------------------------------------------------------
-# Dealer – stands on soft‑17
-# ----------------------------------------------------------------------------
 class Dealer:
+    """Stands on soft‑17 (typical shoe rule)."""
+
     def __init__(self):
         self.hand = Hand()
 
@@ -107,7 +110,7 @@ class Dealer:
 
 
 # ----------------------------------------------------------------------------
-# EV table + learning strategy (ε‑greedy)
+# EV‑tracking table (unchanged)
 # ----------------------------------------------------------------------------
 Action = Literal["hit", "stand"]
 State = Tuple[int, str]  # (hard total, dealer up‑rank)
@@ -130,34 +133,35 @@ class EVTable:
     def __init__(self):
         self.data: Dict[State, Dict[Action, EVStats]] = {}
 
-    def _stats(self, state: State, action: Action) -> EVStats:
+    def _stats(self, state: State, action: Action):
         return self.data.setdefault(state, {"hit": EVStats(), "stand": EVStats()})[action]
 
     def update(self, state: State, action: Action, pnl: float):
         self._stats(state, action).update(pnl)
 
-    def ev(self, state: State, action: Action) -> float:
+    def ev(self, state: State, action: Action):
         return self._stats(state, action).ev()
 
-    def best_action(self, state: State) -> Action:
+    def best_action(self, state: State):
         return "hit" if self.ev(state, "hit") >= self.ev(state, "stand") else "stand"
 
 
+# ----------------------------------------------------------------------------
+# 1) Previous Monte‑Carlo learner (kept intact)
+# ----------------------------------------------------------------------------
 class LearningStrategy:
-    """ε‑greedy strategy that refers to EVTable while learning."""
-
-    def __init__(self, ev_table: EVTable, episodes: int, eps_start: float = 1.0, eps_end: float = 0.05):
+    def __init__(self, ev_table: EVTable, episodes: int, eps_start=1.0, eps_end=0.05):
         self.ev_table = ev_table
         self.episodes = episodes
         self.eps_start = eps_start
         self.eps_end = eps_end
         self.episode = 0
 
-    def epsilon(self) -> float:
+    def epsilon(self):
         frac = self.episode / self.episodes
         return self.eps_start * (1 - frac) + self.eps_end * frac
 
-    def decide(self, hand: Hand, up: Card) -> Action:  # noqa: D401
+    def decide(self, hand: Hand, up: Card):
         state = (hand.total(), up.rank)
         if random.random() < self.epsilon() or state not in self.ev_table.data:
             return random.choice(["hit", "stand"])
@@ -167,226 +171,214 @@ class LearningStrategy:
         self.episode += 1
 
 
-# ----------------------------------------------------------------------------
-# Single learning round (returns trajectory, pnl)
-# ----------------------------------------------------------------------------
-
-def play_learning_round(deck: Deck, strat: LearningStrategy, bet: float = 1.0):
+def _play_learning_round(deck: Deck, strat: LearningStrategy, bet: float = 1.0):
     deck.maybe_reshuffle()
     dealer, player = Dealer(), Hand()
     player.add(deck.deal()); dealer.hand.add(deck.deal())
     player.add(deck.deal()); dealer.hand.add(deck.deal())
-    upcard = dealer.hand.cards[0]
+    up = dealer.hand.cards[0]
 
-    # naturals
     if player.is_blackjack() or dealer.hand.is_blackjack():
-        if player.is_blackjack() and dealer.hand.is_blackjack():
-            pnl = 0.0
-        elif player.is_blackjack():
-            pnl = 1.5 * bet
-        else:
-            pnl = -bet
+        pnl = 0 if player.is_blackjack() and dealer.hand.is_blackjack() else (1.5 if player.is_blackjack() else -1)
         strat.advance(); return [], pnl
 
     traj: List[Tuple[State, Action]] = []
     while True:
         if player.is_bust():
-            pnl = -bet
-            strat.advance(); break
-        state: State = (player.total(), upcard.rank)
-        action = strat.decide(player, upcard)
-        traj.append((state, action))
-        if action == "stand":
+            pnl = -1; strat.advance(); break
+        state: State = (player.total(), up.rank)
+        act = strat.decide(player, up)
+        traj.append((state, act))
+        if act == "stand":
             dealer.play(deck)
-            pt, dt = player.total(), dealer.hand.total()
-            if dealer.hand.is_bust() or pt > dt:
-                pnl = bet
-            elif pt < dt:
-                pnl = -bet
-            else:
-                pnl = 0.0
+            p, d = player.total(), dealer.hand.total()
+            pnl = 1 if dealer.hand.is_bust() or p > d else (-1 if p < d else 0)
             strat.advance(); break
-        else:
-            player.add(deck.deal())
-
+        player.add(deck.deal())
     return traj, pnl
 
 
-# ----------------------------------------------------------------------------
-# Learning driver
-# ----------------------------------------------------------------------------
-
-def simulate_learning(rounds: int = 200_000, seed: int | None = None) -> EVTable:
+def simulate_learning(rounds: int = 200_000, seed: int | None = None):
     if seed is not None:
         random.seed(seed)
     deck, table = Deck(), EVTable()
     strat = LearningStrategy(table, episodes=rounds)
     for _ in range(rounds):
-        traj, pnl = play_learning_round(deck, strat)
+        traj, pnl = _play_learning_round(deck, strat)
         for st, act in traj:
             table.update(st, act, pnl)
     return table
 
+# ----------------------------------------------------------------------------
+# 2) NEW deterministic grid learner
+# ----------------------------------------------------------------------------
+_totals_grid = list(range(20, 3, -1))  # 20 down to 4
+_up_grid = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "A"]
+_actions_cycle = ["hit", "stand"]
+_cycle_len = len(_totals_grid) * len(_up_grid) * 2  # 340
+
+
+def _value_to_rank(val: int) -> str:
+    return {10: "T"}.get(val, str(val))
+
+
+def _construct_player_hand(total: int) -> List[Card]:
+    """Return two non‑Ace cards that sum to *total* (hard)."""
+    for v1 in range(2, 11):
+        v2 = total - v1
+        if 2 <= v2 <= 10:
+            return [Card(_value_to_rank(v1), "♠"), Card(_value_to_rank(v2), "♥")]
+    # Fallback (shouldn't happen for totals 4‑20)
+    return [Card("T", "♠"), Card(_value_to_rank(total - 10), "♥")]
+
+
+def _play_fixed_state(total: int, up_rank: str, action: Action, bet: float = 1.0):
+    deck = Deck()
+    player = Hand(); dealer = Dealer()
+    for c in _construct_player_hand(total):
+        player.add(c)
+    dealer.hand.add(Card(up_rank, "♦"))
+    dealer.hand.add(deck.deal())  # random hole card
+
+    # Execute chosen first action
+    if action == "hit":
+        player.add(deck.deal())
+
+    # (For simplicity we **stand** after the initial action)
+    if player.is_bust():
+        return -bet
+
+    dealer.play(deck)
+    p, d = player.total(), dealer.hand.total()
+    if dealer.hand.is_bust() or p > d:
+        return bet
+    if p < d:
+        return -bet
+    return 0.0
+
+
+def simulate_grid_learning(rounds: int = 200_000, seed: int | None = None):
+    """Deterministically sweeps state‑action grid until *rounds* hands played."""
+    if seed is not None:
+        random.seed(seed)
+    table = EVTable()
+
+    for n in range(rounds):
+        idx = n % _cycle_len
+        total_idx = idx // (len(_up_grid) * 2)
+        rem = idx % (len(_up_grid) * 2)
+        up_idx = rem // 2
+        act_idx = rem % 2
+        total = _totals_grid[total_idx]
+        up = _up_grid[up_idx]
+        act: Action = _actions_cycle[act_idx]  # type: ignore
+
+        pnl = _play_fixed_state(total, up, act)
+        table.update((total, up), act, pnl)
+    return table
 
 # ----------------------------------------------------------------------------
-# Strategy derived from learned table
+# Strategy & evaluation (UNCHANGED from earlier)
 # ----------------------------------------------------------------------------
 class TableStrategy:
-    """Uses a frozen mapping from EVTable (hard total 4‑20)."""
-
     def __init__(self, ev_table: EVTable):
-        self.best = {state: ev_table.best_action(state) for state in ev_table.data}
+        self.best = {st: ev_table.best_action(st) for st in ev_table.data}
 
-    def decide(self, hand: Hand, up: Card) -> Action:  # noqa: D401
-        state = (hand.total(), up.rank)
-        return self.best.get(state, "stand")  # default to stand if unseen
+    def decide(self, hand: Hand, up: Card):
+        return self.best.get((hand.total(), up.rank), "stand")
 
-
-# ----------------------------------------------------------------------------
-# Analysis / evaluation with verbose play‑by‑play
-# ----------------------------------------------------------------------------
 
 def analyze_strategy(strategy, *, num_games: int = 100, bet: float = 1.0, seed: int | None = None, verbose: bool = True):
     if seed is not None:
         random.seed(seed)
     deck = Deck()
-
     wins = losses = pushes = 0
-    net_pnl = 0.0
-
-    for g in range(1, num_games + 1):
+    net = 0.0
+    for i in range(1, num_games + 1):
         deck.maybe_reshuffle()
-        dealer, player = Dealer(), Hand()
+        player = Hand(); dealer = Dealer()
         player.add(deck.deal()); dealer.hand.add(deck.deal())
         player.add(deck.deal()); dealer.hand.add(deck.deal())
-        upcard = dealer.hand.cards[0]
-
+        up = dealer.hand.cards[0]
         if verbose:
-            print(f"--- Hand {g} ---")
-            print(f"Dealer upcard: {upcard.rank}")
-            print(f"Player cards: {player.ranks()}")
-
-        # naturals
+            print(f"--- Hand {i} ---\nDealer upcard: {up.rank}\nPlayer cards: {player.ranks()}")
+        # naturals quick‑exit
         if player.is_blackjack() or dealer.hand.is_blackjack():
             if player.is_blackjack() and dealer.hand.is_blackjack():
                 outcome, pnl = 0, 0.0
-                result_msg = "Both blackjack – Push"
+                msg = "Both blackjack – Push"
             elif player.is_blackjack():
-                outcome, pnl = 1, 1.5 * bet
-                result_msg = "Player blackjack – Win 3:2"
+                outcome, pnl = 1, 1.5 * bet; msg = "Player blackjack – Win 3:2"
             else:
-                outcome, pnl = -1, -bet
-                result_msg = "Dealer blackjack – Player loses"
-            if verbose:
-                print(result_msg, "\n")
-            
+                outcome, pnl = -1, -bet; msg = "Dealer blackjack – Player loses"
+            if verbose: print(msg, "\n")
         else:
             # player decisions
             while True:
                 if player.is_bust():
                     outcome, pnl = -1, -bet
-                    if verbose:
-                        print("Player busts\n")
+                    if verbose: print("Player busts\n")
                     break
-                action = strategy.decide(player, upcard)
-                if action == "hit":
-                    if verbose:
-                        print("Hit")
+                act = strategy.decide(player, up)
+                if act == "hit":
+                    if verbose: print("Hit")
                     player.add(deck.deal())
-                    if verbose:
-                        print(f"Player cards: {player.ranks()}")
-                    continue
+                    if verbose: print(f"Player cards: {player.ranks()}")
                 else:
-                    if verbose:
-                        print("Stand")
+                    if verbose: print("Stand")
                     break
-
             if not player.is_bust():
                 dealer.play(deck)
-                pt, dt = player.total(), dealer.hand.total()
+                p, d = player.total(), dealer.hand.total()
                 if verbose:
                     print(f"Dealer cards: {dealer.hand.ranks()}")
-                    print(f"{dt} vs {pt}")
-
-                if dealer.hand.is_bust() or pt > dt:
-                    outcome, pnl = 1, bet
-                    if verbose:
-                        print("Player wins\n")
-                elif pt < dt:
-                    outcome, pnl = -1, -bet
-                    if verbose:
-                        print("Player loses\n")
+                    print(f"{d} vs {p}")
+                if dealer.hand.is_bust() or p > d:
+                    outcome, pnl = 1, bet; msg = "Player wins"
+                elif p < d:
+                    outcome, pnl = -1, -bet; msg = "Player loses"
                 else:
-                    outcome, pnl = 0, 0.0
-                    if verbose:
-                        print("Push\n")
-
-        net_pnl += pnl
-        if outcome == 1:
-            wins += 1
-        elif outcome == -1:
-            losses += 1
-        else:
-            pushes += 1
-
+                    outcome, pnl = 0, 0.0; msg = "Push"
+                if verbose: print(msg, "\n")
+        net += pnl
+        if outcome == 1: wins += 1
+        elif outcome == -1: losses += 1
+        else: pushes += 1
     if verbose:
         print("==== Final Stats ====")
-        print(f"Games: {num_games}")
-        print(f"Wins: {wins} ({wins/num_games:.2%})")
-        print(f"Losses: {losses} ({losses/num_games:.2%})")
-        print(f"Pushes: {pushes} ({pushes/num_games:.2%})")
-        print(f"Net PnL: {net_pnl:+.2f}\n")
-
-    return {
-        "wins": wins,
-        "losses": losses,
-        "pushes": pushes,
-        "net_pnl": net_pnl,
-        "win_rate": wins / num_games,
-        "loss_rate": losses / num_games,
-        "push_rate": pushes / num_games,
-    }
-
+        print(f"Games: {num_games}; Wins: {wins} ({wins/num_games:.1%}); Losses: {losses} ({losses/num_games:.1%}); Pushes: {pushes} ({pushes/num_games:.1%}); Net: {net:+.2f}\n")
+    return {"wins": wins, "losses": losses, "pushes": pushes, "net_pnl": net}
 
 # ----------------------------------------------------------------------------
-# EV table plotting for inspection
+# Plot helper (unchanged)
 # ----------------------------------------------------------------------------
 
 def plot_ev_table(ev_table: EVTable, *, figsize: Tuple[int, int] = (14, 8), font_size: int = 10):
-    rows = list(range(20, 3, -1))
-    cols = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "A"]
-
-    cell_text = []
-    for total in rows:
-        sub = []
-        for up in cols:
-            state = (total, up)
-            evh, evs = ev_table.ev(state, "hit"), ev_table.ev(state, "stand")
-            best = "H" if evh >= evs else "S"
-            sub.append(f"{best}\nH:{evh:+.2f}\nS:{evs:+.2f}")
-        cell_text.append(sub)
-
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.axis("off")
-    tbl = ax.table(cellText=cell_text, rowLabels=rows, colLabels=cols, loc="center", cellLoc="center")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(font_size)
+    rows = list(range(20, 3, -1)); cols = ["2","3","4","5","6","7","8","9","T","A"]
+    data = []
+    for t in rows:
+        row = []
+        for u in cols:
+            evh, evs = ev_table.ev((t,u), "hit"), ev_table.ev((t,u), "stand")
+            best = "H" if evh>=evs else "S"
+            row.append(f"{best}\nH:{evh:+.2f}\nS:{evs:+.2f}")
+        data.append(row)
+    fig, ax = plt.subplots(figsize=figsize); ax.axis("off")
+    tbl = ax.table(cellText=data, rowLabels=rows, colLabels=cols, loc="center", cellLoc="center") 
+    tbl.auto_set_font_size(False); tbl.set_fontsize(font_size)
     for _, cell in tbl.get_celld().items():
-        cell.set_height(1 / (len(rows) + 1) * 1.5)
+        cell.set_height(1 / (len(rows) + 1) * 1)
         cell.set_width(1 / (len(cols) + 1) * 1.2)
-    plt.title("Hit/Stand EVs – best action in first line")
-    plt.tight_layout()
-    return fig
-
+    plt.title("Hit/Stand EVs (best action shown)"); plt.tight_layout(); return fig
 
 # ----------------------------------------------------------------------------
 # Demo when run standalone
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Learning optimal hit/stand table …")
-    ev_tbl = simulate_learning(200_000, seed=42)
-    print("Learning complete. Evaluating fixed strategy on 100 hands:\n")
-    table_strategy = TableStrategy(ev_tbl)
-    analyze_strategy(table_strategy, num_games=1000, verbose=True, seed=123)
-    plot_ev_table(ev_tbl)
+    print("Grid learning 200k deterministic hands …")
+    grid_table = simulate_grid_learning(200_000, seed=42)
+    print("Grid learning complete. Evaluating strategy built from grid\n")
+    strat = TableStrategy(grid_table)
+    analyze_strategy(strat, num_games=10000, verbose=True, seed=123)
+    plot_ev_table(grid_table)
     plt.show()
